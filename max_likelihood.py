@@ -3,78 +3,145 @@ import jax.numpy as jnp
 import jax.scipy.linalg
 from jax import value_and_grad
 from scipy.optimize import minimize
-import numpy as np
 from jax.scipy.stats import multivariate_normal
 from functools import partial
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+import matplotlib.pyplot as plt
+import numpy as np
 
-def kernel(X1, X2, log_c, log_b):
-    c = jnp.exp(log_c)
-    b = jnp.exp(log_b)
-    diff = X1[:, None, :] - X2[None, :, :]
-    sq_dist = jnp.sum(b * (diff ** 2), axis=2)
-    return c * jnp.exp(-0.5 * sq_dist)
-
-def pack_params(X_bar, log_c, log_b, log_sigma_sq):
-    return jnp.concatenate([X_bar.ravel(), log_c[None], log_b, log_sigma_sq[None]])
-
-@partial(jax.jit, static_argnums=(1, 2))
-def unpack_params(params, M, D):
-    """Unpack parameters with static shapes"""
-    # Use static indexing by making M and D static arguments
-    X_bar = params[:M*D].reshape(M, D)
-    log_c = params[M*D]
-    log_b = params[M*D + 1:M*D + 1 + D]
-    log_sigma_sq = params[M*D + 1 + D]
+class SparseGPModel:
+    def __init__(self, N, D, M):
+        self.N = N
+        self.D = D
+        self.M = M
+        
+    @partial(jax.jit, static_argnums=0)
+    def kernel(self, X1, X2, log_c, log_b):
+        c = jnp.exp(log_c)
+        b = jnp.exp(log_b)
+        diff = X1[:, None, :] - X2[None, :, :]
+        sq_dist = jnp.sum(b * (diff ** 2), axis=2)
+        return c * jnp.exp(-0.5 * sq_dist)
     
-    return X_bar, log_c, log_b, log_sigma_sq
-
-@jax.jit
-def neg_log_likelihood(params, M, D, X, y, jitter=1e-6):
-    X_bar, log_c, log_b, log_sigma_sq = unpack_params(params, M, D)
-    # log_likelihood = multivariate_normal.logpdf(y, mean=0.0, cov=K)
-    c = jnp.exp(log_c)
-    b = jnp.exp(log_b)
-    sigma_sq = jnp.exp(log_sigma_sq)
+    def pack_params(self, X_bar, log_c, log_b, log_sigma_sq):
+        return jnp.concatenate([X_bar.ravel(), log_c[None], log_b, log_sigma_sq[None]])
     
-    # Ensure y is properly shaped (N, 1)
+    @partial(jax.jit, static_argnums=0)
+    def unpack_params(self, params):
+        X_bar = params[:self.M*self.D].reshape(self.M, self.D)
+        log_c = params[self.M*self.D]
+        log_b = params[self.M*self.D + 1:self.M*self.D + 1 + self.D]
+        log_sigma_sq = params[self.M*self.D + 1 + self.D]
+        return X_bar, log_c, log_b, log_sigma_sq
+    
+    @partial(jax.jit, static_argnums=0)
+    def neg_log_likelihood(self, params, X, y, jitter=1e-6):
+        X_bar, log_c, log_b, log_sigma_sq = self.unpack_params(params)
+        c = jnp.exp(log_c)
+        b = jnp.exp(log_b)
+        sigma_sq = jnp.exp(log_sigma_sq)
+        
+        # Keep y as a vector, don't reshape
+        
+        K_M = self.kernel(X_bar, X_bar, log_c, log_b) + jitter * jnp.eye(self.M)    
+        K_NM = self.kernel(X, X_bar, log_c, log_b)
+        K_M_inv = jnp.linalg.inv(K_M)
+        quad_terms = jnp.sum(K_NM @ K_M_inv @ K_NM.T, axis=1)
+        
+        lambda_diag = c - quad_terms
+        
+        # Construct the covariance matrix
+        cov = quad_terms[:, None] + jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N) + jitter * jnp.eye(self.N)
+        
+        # Compute log likelihood (returns scalar)
+        nll = -multivariate_normal.logpdf(y, mean=jnp.zeros_like(y), cov=cov)
+        
+        return nll
+
+def run_likelihood_optimization(N, D, M, X, y):
+    model = SparseGPModel(N, D, M)
+    
+    # Initialize parameters
+    X_bar_init = jnp.array(X[jax.random.choice(jax.random.PRNGKey(0), N, shape=(M,), replace=False)])
+    log_c_init = jnp.log(1.0)
+    log_b_init = jnp.zeros(D)
+    log_sigma_sq_init = jnp.log(0.1)
+    params_init = model.pack_params(X_bar_init, log_c_init, log_b_init, log_sigma_sq_init)
+
+    # Convert JAX arrays to NumPy arrays
+    def objective(params_np):
+        params_jax = jnp.array(params_np)
+        value, grad = obj_grad(params_jax)
+        return np.array(value), np.array(grad)
+
+    # Optimize using NumPy arrays
+    obj_grad = jax.value_and_grad(lambda p: model.neg_log_likelihood(p, X, y))
+    result = minimize(
+        lambda p: objective(p)[0],
+        np.array(params_init),
+        method='L-BFGS-B',
+        jac=lambda p: objective(p)[1]
+    )
+
+    # Convert back to JAX array for unpacking
+    return model.unpack_params(jnp.array(result.x))
+
+def GP_predict(X, y,
+               kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-2),
+               plot=True):
+    X = X.reshape(-1, 1)
     y = y.reshape(-1, 1)
-    
-    # Compute kernel matrices with jitter
-    K_M = kernel(X_bar, X_bar, log_c, log_b) + jitter * jnp.eye(M)    
-    K_NM = kernel(X, X_bar, log_c, log_b)
-    K_M_inv = jnp.linalg.inv(K_M)
-    quad_terms = jnp.sum(K_NM @ K_M_inv * K_NM.T, axis=1)
 
-    # K_nn is just the diagonal kernel value: c
-    lambda_diag = c - quad_terms
-    
-    nll = -multivariate_normal.logpdf(y, mean=0.0, cov=quad_terms + jnp.diag(lambda_diag) + sigma_sq * jnp.eye()+ jitter)
-    return nll.squeeze()
 
-# Example setup
+    # Fit GP
+    gp = GaussianProcessRegressor(kernel=kernel, alpha=0.0)
+    gp.fit(X, y)
+
+    # Test points for prediction
+    X_pred = np.linspace(X.min() - 1, X.max() + 1, 500).reshape(-1, 1)
+    y_mean, y_std = gp.predict(X_pred, return_std=True)
+
+    # Draw samples from posterior
+    samples = gp.sample_y(X_pred, n_samples=3, random_state=0)
+
+    if plot:
+        # Plot
+        plt.figure(figsize=(10, 5))
+        plt.plot(X_pred, y_mean, 'b-', label='Mean prediction')
+        plt.fill_between(
+            X_pred.ravel(),
+            y_mean.ravel() - 2 * y_std,
+            y_mean.ravel() + 2 * y_std,
+            color='blue',
+            alpha=0.2,
+            label='95% confidence interval'
+        )
+        plt.plot(X, y, 'ko', label='Observations')
+
+        for i, sample in enumerate(samples.T):
+            plt.plot(X_pred, sample, lw=1, ls='--', alpha=0.7, label=f'Sample {i+1}' if i == 0 else None)
+
+        plt.legend()
+        plt.title("Gaussian Process Regression")
+        plt.xlabel("X")
+        plt.ylabel("y")
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    return X_pred, y_mean, y_std, samples
+
+
+# Example usage
 N, D, M = 100, 2, 20
-np.random.seed(0)
-X = jnp.array(np.random.randn(N, D))  # Convert to JAX array
-y = jnp.array(np.random.randn(N))     # Convert to JAX array
-
-# Initialize parameters
-X_bar_init = jnp.array(X[jax.random.choice(jax.random.PRNGKey(0), N, shape=(M,), replace=False)])
-log_c_init = jnp.log(1.0)
-log_b_init = jnp.zeros(D)
-log_sigma_sq_init = jnp.log(0.1)
-params_init = pack_params(X_bar_init, log_c_init, log_b_init, log_sigma_sq_init)
-
-# Optimize
-obj_grad = jax.value_and_grad(lambda p, M, D, X, y: neg_log_likelihood(p, M, D, X, y))
-result = minimize(
-    lambda p: obj_grad(p, M, D, X, y)[0],
-    params_init,
-    method='L-BFGS-B',
-    jac=lambda p: obj_grad(p, M, D, X, y)[1]
-)
+key = jax.random.PRNGKey(0)
+X = jax.random.normal(key, shape=(N, D))
+y = jax.random.normal(key, shape=(N,))
 
 # Extract results
-X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = unpack_params(result.x, M, D)
+X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = run_likelihood_optimization(N, D, M, X, y)
+
 c_opt = jnp.exp(log_c_opt)
 b_opt = jnp.exp(log_b_opt)
 sigma_sq_opt = jnp.exp(log_sigma_sq_opt)
