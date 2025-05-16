@@ -42,8 +42,6 @@ class SparseGPModel:
         b = jnp.exp(log_b)
         sigma_sq = jnp.exp(log_sigma_sq)
         
-        # Keep y as a vector, don't reshape
-        
         K_M = self.kernel(X_bar, X_bar, log_c, log_b) + jitter * jnp.eye(self.M)    
         K_NM = self.kernel(X, X_bar, log_c, log_b)
         K_M_inv = jnp.linalg.inv(K_M)
@@ -54,37 +52,47 @@ class SparseGPModel:
         # Construct the covariance matrix
         cov = quad_terms[:, None] + jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N) + jitter * jnp.eye(self.N)
         
-        # Compute log likelihood (returns scalar)
-        nll = -multivariate_normal.logpdf(y, mean=jnp.zeros_like(y), cov=cov)
+        # Sum the log likelihood to get a scalar
+        nll = -jnp.sum(multivariate_normal.logpdf(y, mean=jnp.zeros_like(y), cov=cov))
         
         return nll
 
 def run_likelihood_optimization(N, D, M, X, y):
     model = SparseGPModel(N, D, M)
     
+    # Enable float64 support in JAX
+    jax.config.update("jax_enable_x64", True)
+    
     # Initialize parameters
     X_bar_init = jnp.array(X[jax.random.choice(jax.random.PRNGKey(0), N, shape=(M,), replace=False)])
-    log_c_init = jnp.log(1.0)
+    log_c_init = jnp.array(0.0)  # log(1.0)
     log_b_init = jnp.zeros(D)
-    log_sigma_sq_init = jnp.log(0.1)
+    log_sigma_sq_init = jnp.array(-2.3)  # log(0.1)
     params_init = model.pack_params(X_bar_init, log_c_init, log_b_init, log_sigma_sq_init)
 
-    # Convert JAX arrays to NumPy arrays
+    # Define objective function outside of class context
+    def neg_log_likelihood_fn(params):
+        return model.neg_log_likelihood(params, X, y)
+
+    # Create value and gradient function
+    obj_grad = jax.value_and_grad(neg_log_likelihood_fn)
+
+    # Define objective for scipy optimizer
     def objective(params_np):
         params_jax = jnp.array(params_np)
         value, grad = obj_grad(params_jax)
         return np.array(value), np.array(grad)
 
-    # Optimize using NumPy arrays
-    obj_grad = jax.value_and_grad(lambda p: model.neg_log_likelihood(p, X, y))
+    # Convert to NumPy array for scipy optimizer
+    params_init_np = np.array(params_init)
+    
     result = minimize(
         lambda p: objective(p)[0],
-        np.array(params_init),
+        params_init_np,
         method='L-BFGS-B',
         jac=lambda p: objective(p)[1]
     )
 
-    # Convert back to JAX array for unpacking
     return model.unpack_params(jnp.array(result.x))
 
 def GP_predict(X, y,
