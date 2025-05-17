@@ -47,15 +47,35 @@ class SparseGPModel:
         K_M_inv = jnp.linalg.inv(K_M)
         quad_terms = jnp.sum(K_NM @ K_M_inv @ K_NM.T, axis=1)
         
-        lambda_diag = c - quad_terms
+        # Reshape y to (N,1) for kernel computation
+        y_reshaped = y.reshape(-1, 1)
+        K_y = self.kernel(y_reshaped, y_reshaped, log_c, log_b)
+        lambda_diag = jnp.diag(K_y) - quad_terms
         
         # Construct the covariance matrix
         cov = quad_terms[:, None] + jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N) + jitter * jnp.eye(self.N)
+        mean = jnp.zeros_like(y)
         
-        # Sum the log likelihood to get a scalar
-        nll = -jnp.sum(multivariate_normal.logpdf(y, mean=jnp.zeros_like(y), cov=cov))
-        
+        nll = -jnp.sum(multivariate_normal.logpdf(y, mean=mean, cov=cov))
         return nll
+    
+    def mean_f_bar(self, X, y, X_bar, log_c, log_b, log_sigma_sq, jitter=1e-6):
+        c = jnp.exp(log_c)
+        b = jnp.exp(log_b)
+        sigma_sq = jnp.exp(log_sigma_sq)
+        
+        K_M = self.kernel(X_bar, X_bar, log_c, log_b) + jitter * jnp.eye(self.M)    
+        K_NM = self.kernel(X, X_bar, log_c, log_b)
+        K_M_inv = jnp.linalg.inv(K_M)
+        quad_terms = jnp.sum(K_NM @ K_M_inv @ K_NM.T, axis=1)
+        
+        y_reshaped = y.reshape(-1, 1)
+        K_y = self.kernel(y_reshaped, y_reshaped, log_c, log_b)
+        lambda_diag = jnp.diag(K_y) - quad_terms
+        Q = K_M + K_NM.T @ (jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N)) @ K_NM
+        Q_inv = jnp.linalg.inv(Q)
+        mean = K_M @ Q_inv @ K_NM.T @ (jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N)) @ y
+        return mean
 
 def run_likelihood_optimization(N, D, M, X, y):
     model = SparseGPModel(N, D, M)
@@ -92,8 +112,9 @@ def run_likelihood_optimization(N, D, M, X, y):
         method='L-BFGS-B',
         jac=lambda p: objective(p)[1]
     )
-
-    return model.unpack_params(jnp.array(result.x))
+    X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = model.unpack_params(jnp.array(result.x))
+    f_bar = model.mean_f_bar(X, y, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt)
+    return f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt
 
 def GP_predict(X, y,
                kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-2),
@@ -107,7 +128,7 @@ def GP_predict(X, y,
     gp.fit(X, y)
 
     # Test points for prediction
-    X_pred = np.linspace(X.min() - 1, X.max() + 1, 500).reshape(-1, 1)
+    X_pred = np.linspace(X.min() - 1, X.max() + 1, 1000).reshape(-1, 1)
     y_mean, y_std = gp.predict(X_pred, return_std=True)
 
     # Draw samples from posterior
@@ -115,7 +136,7 @@ def GP_predict(X, y,
 
     if plot:
         # Plot
-        plt.figure(figsize=(10, 5))
+        # plt.figure(figsize=(10, 5))
         plt.plot(X_pred, y_mean, 'b-', label='Mean prediction')
         plt.fill_between(
             X_pred.ravel(),
@@ -136,25 +157,25 @@ def GP_predict(X, y,
         plt.ylabel("y")
         plt.grid(True, linestyle='--', alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        plt.show(block=False)
 
     return X_pred, y_mean, y_std, samples
 
 
-# Example usage
-N, D, M = 100, 2, 20
-key = jax.random.PRNGKey(0)
-X = jax.random.normal(key, shape=(N, D))
-y = jax.random.normal(key, shape=(N,))
+# # Example usage
+# N, D, M = 100, 2, 20
+# key = jax.random.PRNGKey(0)
+# X = jax.random.normal(key, shape=(N, D))
+# y = jax.random.normal(key, shape=(N,))
 
-# Extract results
-X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = run_likelihood_optimization(N, D, M, X, y)
+# # Extract results
+# X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = run_likelihood_optimization(N, D, M, X, y)
 
-c_opt = jnp.exp(log_c_opt)
-b_opt = jnp.exp(log_b_opt)
-sigma_sq_opt = jnp.exp(log_sigma_sq_opt)
+# c_opt = jnp.exp(log_c_opt)
+# b_opt = jnp.exp(log_b_opt)
+# sigma_sq_opt = jnp.exp(log_sigma_sq_opt)
 
-print("Optimized pseudo-inputs:\n", X_bar_opt)
-print("Optimized c:", c_opt)
-print("Optimized b:", b_opt)
-print("Optimized sigma²:", sigma_sq_opt)
+# print("Optimized pseudo-inputs:\n", X_bar_opt)
+# print("Optimized c:", c_opt)
+# print("Optimized b:", b_opt)
+# print("Optimized sigma²:", sigma_sq_opt)
