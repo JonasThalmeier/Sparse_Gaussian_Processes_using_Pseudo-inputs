@@ -11,24 +11,65 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 class SparseGPModel:
+    """
+    Sparse Gaussian Process model using inducing points for scalable inference.
+    
+    Attributes:
+        N (int): Number of training points
+        D (int): Dimension of input space
+        M (int): Number of inducing points
+    """
     def __init__(self, N, D, M):
-        self.N = N
-        self.D = D
-        self.M = M
+        self.N = N  # Number of data points
+        self.D = D  # Input dimension
+        self.M = M  # Number of inducing points
         
     @partial(jax.jit, static_argnums=0)
     def kernel(self, X1, X2, log_c, log_b):
-        c = jnp.exp(log_c)
-        b = jnp.exp(log_b)
-        diff = X1[:, None, :] - X2[None, :, :]
-        sq_dist = jnp.sum(b * (diff ** 2), axis=2)
-        return c * jnp.exp(-0.5 * sq_dist)
+        """
+        Compute RBF kernel between two sets of points.
+        
+        Args:
+            X1: First set of points (N x D)
+            X2: Second set of points (M x D)
+            log_c: Log of kernel amplitude
+            log_b: Log of length scales
+        
+        Returns:
+            Kernel matrix of shape (N x M)
+        """
+        c = jnp.exp(log_c)  # Kernel amplitude
+        b = jnp.exp(log_b)  # Length scales
+        diff = X1[:, None, :] - X2[None, :, :]  # Pairwise differences
+        sq_dist = jnp.sum(b * (diff ** 2), axis=2)  # Weighted distances
+        return c * jnp.exp(-0.5 * sq_dist)  # RBF kernel
     
     def pack_params(self, X_bar, log_c, log_b, log_sigma_sq):
+        """
+        Pack all parameters into a single vector for optimization.
+        
+        Args:
+            X_bar: Inducing points (M x D)
+            log_c: Log kernel amplitude
+            log_b: Log length scales
+            log_sigma_sq: Log noise variance
+        
+        Returns:
+            Concatenated parameter vector
+        """
         return jnp.concatenate([X_bar.ravel(), log_c[None], log_b, log_sigma_sq[None]])
     
     @partial(jax.jit, static_argnums=0)
     def unpack_params(self, params):
+        """
+        Unpack parameters from optimization vector into separate components.
+        
+        Args:
+            params: Concatenated parameter vector
+        
+        Returns:
+            Tuple of (X_bar, log_c, log_b, log_sigma_sq)
+        """
         X_bar = params[:self.M*self.D].reshape(self.M, self.D)
         log_c = params[self.M*self.D]
         log_b = params[self.M*self.D + 1:self.M*self.D + 1 + self.D]
@@ -84,7 +125,8 @@ def run_likelihood_optimization(N, D, M, X, y):
     jax.config.update("jax_enable_x64", True)
     
     # Initialize parameters
-    X_bar_init = jnp.array(X[jax.random.choice(jax.random.PRNGKey(0), N, shape=(M,), replace=False)])
+    # X_bar_init = jnp.array(X[jax.random.choice(jax.random.PRNGKey(0), N, shape=(M,), replace=False)])
+    X_bar_init = jax.random.uniform(jax.random.PRNGKey(0), shape=(M, D), minval=0.0, maxval=0.5)
     log_c_init = jnp.array(0.0)  # log(1.0)
     log_b_init = jnp.zeros(D)
     log_sigma_sq_init = jnp.array(-2.3)  # log(0.1)
@@ -114,9 +156,9 @@ def run_likelihood_optimization(N, D, M, X, y):
     )
     X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = model.unpack_params(jnp.array(result.x))
     f_bar = model.mean_f_bar(X, y, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt)
-    return f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt
+    return f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt, X_bar_init
 
-def GP_predict(X, y,
+def GP_predict(X, y, Xmin, Xmax,
                kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-2),
                plot=True):
     X = X.reshape(-1, 1)
@@ -128,7 +170,7 @@ def GP_predict(X, y,
     gp.fit(X, y)
 
     # Test points for prediction
-    X_pred = np.linspace(X.min() - 1, X.max() + 1, 1000).reshape(-1, 1)
+    X_pred = np.linspace(Xmin, Xmax, 1000).reshape(-1, 1)
     y_mean, y_std = gp.predict(X_pred, return_std=True)
 
     # Draw samples from posterior
@@ -148,8 +190,8 @@ def GP_predict(X, y,
         )
         plt.plot(X, y, 'ko', label='Observations')
 
-        for i, sample in enumerate(samples.T):
-            plt.plot(X_pred, sample, lw=1, ls='--', alpha=0.7, label=f'Sample {i+1}' if i == 0 else None)
+        # for i, sample in enumerate(samples.T):
+        #     plt.plot(X_pred, sample, lw=1, ls='--', alpha=0.7, label=f'Sample {i+1}' if i == 0 else None)
 
         plt.legend()
         plt.title("Gaussian Process Regression")
