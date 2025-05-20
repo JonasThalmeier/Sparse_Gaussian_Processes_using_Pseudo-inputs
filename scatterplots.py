@@ -1,4 +1,5 @@
-from max_likelihood import SparseGPModel, run_likelihood_optimization, GP_predict
+from sklearn.gaussian_process import GaussianProcessRegressor
+from max_likelihood import SparseGPModel
 import matplotlib.pyplot as plt
 import numpy as np
 import jax.numpy as jnp
@@ -8,28 +9,33 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 # Turn off interactive mode at the start
 plt.ioff()
 
-N, D, M = 70, 1, 20
+N, D, M = 70, 1, 3
 key = jax.random.PRNGKey(41)
 X = jax.random.uniform(key, shape=(N, D), minval=-0.5, maxval=1.5)
 # Generate y with shape (N,) by using ravel()
 y = jnp.array(jnp.mean(1.9*X+1.2*X**2-4.1*X**3+0.5*X**4+0.6*X**5+0.2*X**6 + np.sin(X), axis=1) + 0.3 * np.random.randn(N,))
 
-# Extract results
-model, f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt, X_bar_init = run_likelihood_optimization(N, D, M, X, y)
+# Fit and predict with the full GP
+X_pred = np.linspace(X.min()-0.5, X.max()+0.5, 500).reshape(-1, 1)
+gp = GaussianProcessRegressor(
+        kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-3),
+        alpha=1e-6,  # Add small noise to improve conditioning
+        n_restarts_optimizer=5,
+        normalize_y=True  # Normalize y values for better numerical stability
+    )  
+gp.fit(np.array(X), np.array(y))
+y_mean_full, y_std_full = gp.predict(X_pred, return_std=True)
 
-X_pred_full, y_mean_full, y_std_full, samples_full = GP_predict(X, y, X.min()-0.5, X.max()+0.5,)
-X_pred_sparse, y_mean_sparse, y_std_sparse, samples_sparse = GP_predict(
-    X_bar_opt, 
-    f_bar, 
-    X.min()-0.5, 
-    X.max()+0.5, 
-    kernel=RBF(length_scale=jnp.exp(log_b_opt)) + WhiteKernel(noise_level=jnp.exp(log_sigma_sq_opt))
-)
+# Fit and predict with the sparse GP
+model = SparseGPModel(N, D, M, margin=0.5)
+f_bar, cov_f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt, X_bar_init = model.fit(X, y)
+y_mean_sparse, y_var_sparse = model.predict(X_pred)
+y_std_sparse = jnp.sqrt(y_var_sparse)
 
 plt.figure(1)
-plt.plot(X_pred_full, y_mean_full, 'b-', label='Mean prediction')
+plt.plot(X_pred, y_mean_full, 'b-', label='Mean prediction')
 plt.fill_between(
-    X_pred_full.ravel(),
+    X_pred.ravel(),
     y_mean_full.ravel() - 2 * y_std_full,
     y_mean_full.ravel() + 2 * y_std_full,
     color='blue',
@@ -47,7 +53,7 @@ plt.xlabel("X")
 plt.ylabel("y")
 plt.grid(True, linestyle='--', alpha=0.3)
 plt.tight_layout()
-plt.xlim(X_pred_full.min(), X_pred_full.max())
+plt.xlim(X_pred.min(), X_pred.max())
 
 # Store the y-limits from first plot
 y_min, y_max = plt.ylim()
@@ -59,9 +65,9 @@ plt.close()
 
 
 plt.figure(2)
-plt.plot(X_pred_sparse.ravel(), y_mean_sparse.ravel(), 'b-', label='Mean prediction')
+plt.plot(X_pred.ravel(), y_mean_sparse.ravel(), 'b-', label='Mean prediction')
 plt.fill_between(
-    X_pred_sparse.ravel(),  # Make sure X is 1D
+    X_pred.ravel(),  # Make sure X is 1D
     (y_mean_sparse - 2 * y_std_sparse).ravel(),  # Make sure lower bound is 1D
     (y_mean_sparse + 2 * y_std_sparse).ravel(),  # Make sure upper bound is 1D
     color='blue',
