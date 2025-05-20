@@ -199,14 +199,15 @@ def run_likelihood_optimization(N, D, M, X, y):
     result = minimize(
         lambda p: objective(p)[0],
         params_init,
-        method='L-BFGS-B',
+        # method='L-BFGS-B',
+        method='SLSQP',
         jac=lambda p: objective(p)[1],
         bounds=bounds,
         options={
-            'maxiter': 50000,  # Increase maximum iterations
-            'maxfun': 5000    # Increase maximum function evaluations
-            # 'ftol': 1e-6,      # Add convergence tolerance
-            # 'gtol': 1e-5       # Add gradient tolerance
+            'maxiter': 100000,  # Increase maximum iterations
+            'maxfun': 20000,    # Increase maximum function evaluations
+            'ftol': 1e-8,      # Add convergence tolerance
+            'gtol': 1e-7       # Add gradient tolerance
         }
     )
 
