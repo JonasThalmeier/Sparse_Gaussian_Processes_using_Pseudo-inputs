@@ -1,4 +1,4 @@
-from max_likelihood import SparseGPModel, run_likelihood_optimization, GP_predict
+from max_likelihood import SparseGPModel
 import matplotlib.pyplot as plt
 import numpy as np
 import jax.numpy as jnp
@@ -6,18 +6,13 @@ import jax
 from uci_datasets import Dataset
 import time
 from sklearn.metrics import mean_squared_error
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
 # Load data
 data = Dataset("kin40k")
 x_train, y_train, x_test, y_test = data.get_split(split=0)
 
 # Define number of inducing points to test
-# inducing_points = [10, 20, 50, 100, 200, 500]
-inducing_points = np.linspace(50, 1500, num=15, dtype=int)  # Logarithmic scale for inducing points
-# N = len(x_train)  # Use full training set
-N = 1000
+inducing_points = np.linspace(5, 100, num=15, dtype=int)  # Logarithmic scale for inducing points
 D = x_train.shape[1]
 
 # Initialize arrays to store results
@@ -26,8 +21,8 @@ train_times = []
 inference_times = []
 
 # Ensure consistent sizes between training and test sets
-N_train = 5000  # Size of training set
-N_test = 1000   # Size of test set
+N_train = 500  # Size of training set
+N_test = 100   # Size of test set
 
 # Slice the data to use consistent sizes
 X = jnp.array(x_train[:N_train])
@@ -39,20 +34,15 @@ for M in inducing_points:
     print(f"Training with {M} inducing points...")
     
     # Measure training time
+    model = SparseGPModel(N_train, D, M, margin=0)
     start_time = time.time()
-    f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt = run_likelihood_optimization(N_train, D, M, X, y)
+    f_bar, cov_f_bar, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt, X_bar_init = model.fit(X, y)
     train_time = time.time() - start_time
     train_times.append(train_time)
     
     # Measure inference time
     start_time = time.time()
-    model = SparseGPModel(N_test, D, M)
-    # f_bar_test = model.mean_f_bar(X_test, y_test, X_bar_opt, log_c_opt, log_b_opt, log_sigma_sq_opt)
-    kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-2)
-    gp = GaussianProcessRegressor(kernel=kernel, alpha=0.0)
-    gp.fit(X_bar_opt, f_bar)
-    f_bar_test,_ = gp.predict(X_test, return_std=True)
-    
+    f_bar_test,_ = model.predict(X_test)
     inference_time = time.time() - start_time
     inference_times.append(inference_time)
     
@@ -60,41 +50,79 @@ for M in inducing_points:
     mse = mean_squared_error(y_test, f_bar_test)
     mse_scores.append(mse)
 
+# save results to disk
+results = {
+    'inducing_points': inducing_points,
+    'mse_scores': np.array(mse_scores),
+    'train_times': np.array(train_times),
+    'inference_times': np.array(inference_times),
+    'parameters': {
+        'N_train': N_train,
+        'N_test': N_test,
+        'D': D
+    }
+}
+np.savez_compressed(f'simulation_results.npz', **results)
+
+# Define consistent plotting parameters
+fig_size = (10, 6)
+font_size = 12
+plt.style.use('default')
+plt.rc('font', size=font_size)
+plt.rc('axes', titlesize=font_size+2, labelsize=font_size)
+plt.rc('xtick', labelsize=font_size)
+plt.rc('ytick', labelsize=font_size)
+plt.rc('legend', fontsize=font_size)
+
+# Load results from disk
+loaded = np.load('simulation_results.npz', allow_pickle=True)
+inducing_points = loaded['inducing_points']
+mse_scores = loaded['mse_scores']
+train_times = loaded['train_times']
+inference_times = loaded['inference_times']
+parameters = loaded['parameters'].item()  # Convert numpy array to dict
+
+# Print loaded parameters
+print("Loaded parameters:")
+print(f"N_train: {parameters['N_train']}")
+print(f"N_test: {parameters['N_test']}")
+print(f"D: {parameters['D']}\n")
+
 # Create and save MSE plot with logarithmic y-axis
-plt.figure(figsize=(8, 6))
-plt.semilogy(inducing_points, mse_scores, 'k-o', color='black')  # Use semilogy for log scale on y-axis
+plt.figure(figsize=fig_size)
+plt.semilogy(inducing_points, mse_scores, 'k-o', color='black')
 plt.xlabel('Number of Inducing Points (M)')
 plt.ylabel('Mean Squared Error (log scale)')
 plt.title('MSE vs Number of Inducing Points')
-plt.grid(True, which="both", ls="-")  # Add grid lines for both major and minor ticks
+plt.grid(True, which="both", ls="-")
 plt.tight_layout()
-plt.savefig('mse_plot.png', bbox_inches='tight', dpi=300)
+plt.savefig('mse_plot_loaded.png', bbox_inches='tight', dpi=300)
 plt.close()
 
 # Create and save training time plot
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=fig_size)
 plt.plot(inducing_points, train_times, 'k-o', color='black')
 plt.xlabel('Number of Inducing Points (M)')
 plt.ylabel('Training Time (seconds)')
 plt.title('Training Time vs Number of Inducing Points')
 plt.grid(True)
 plt.tight_layout()
-plt.savefig('training_time_plot.png', bbox_inches='tight', dpi=300)
+plt.savefig('training_time_plot_loaded.png', bbox_inches='tight', dpi=300)
 plt.close()
 
 # Create and save inference time plot
-plt.figure(figsize=(8, 6))
+plt.figure(figsize=fig_size)
 plt.plot(inducing_points, inference_times, 'k-o', color='black')
 plt.xlabel('Number of Inducing Points (M)')
 plt.ylabel('Inference Time (seconds)')
 plt.title('Inference Time vs Number of Inducing Points')
 plt.grid(True)
 plt.tight_layout()
-plt.savefig('inference_time_plot.png', bbox_inches='tight', dpi=300)
+plt.savefig('inference_time_plot_loaded.png', bbox_inches='tight', dpi=300)
 plt.close()
 
 # Print numerical results
-print("\nNumerical Results:")
+print("Numerical Results:")
 print("Inducing Points | MSE | Training Time | Inference Time")
 print("-" * 55)
 for m, mse, t_time, i_time in zip(inducing_points, mse_scores, train_times, inference_times):

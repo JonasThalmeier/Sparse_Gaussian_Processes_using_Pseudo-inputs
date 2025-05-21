@@ -18,6 +18,7 @@ class SparseGPModel:
         N (int): Number of training points
         D (int): Dimension of input space
         M (int): Number of inducing points
+        margin (float): Margin for inducing points
     """
     def __init__(self, N, D, M, margin=0.5):
         self.N = N  # Number of data points
@@ -79,9 +80,29 @@ class SparseGPModel:
     
     @partial(jax.jit, static_argnums=0)
     def neg_log_likelihood(self, params, X, y, jitter=1e-6):
+        """
+        Computes the negative log marginal likelihood of the sparse GP model.
+        
+        This implementation follows Snelson & Ghahramani (2006) using the sparse
+        approximation with M inducing points. The computation uses Cholesky
+        decomposition for numerical stability and includes an optional
+        regularization term to encourage spread-out inducing points.
+        
+        Args:
+            params: Packed parameter vector containing:
+                - X_bar: Inducing point locations (M x D)
+                - log_c: Log of kernel amplitude
+                - log_b: Log of length scales
+                - log_sigma_sq: Log of noise variance
+            X: Input training points (N x D)
+            y: Target values (N,)
+            jitter: Small value added to diagonal for numerical stability
+        
+        Returns:
+            Negative log marginal likelihood value (scalar)
+        """
         X_bar, log_c, log_b, log_sigma_sq = self.unpack_params(params)
         c = jnp.clip(jnp.exp(log_c), 1e-6, 1e6)  # Clip to avoid extreme values
-        b = jnp.clip(jnp.exp(log_b), 1e-6, 1e6)
         sigma_sq = jnp.clip(jnp.exp(log_sigma_sq), 1e-6, 1e6)
         
         # Add more jitter to improve conditioning
@@ -136,33 +157,94 @@ class SparseGPModel:
         sq_dists = jnp.sum(diffs ** 2, axis=-1)
         # Add small value to denominator to avoid division by zero
         reg = jnp.sum(1.0 / (sq_dists + 1e-6)) - X_bar.shape[0]  # exclude self-distances
-        reg_weight = 0#1e-10  # You can tune this weight
+        reg_weight =0#1e-6  # You can tune this weight
         nll += reg_weight * reg
 
         return nll
     
     def f_bar(self, jitter=1e-6):
-        c = jnp.exp(self.log_c_opt)
-        sigma_sq = jnp.exp(self.log_sigma_sq_opt)
+        """
+        Computes the posterior mean and covariance at the inducing points.
         
-        self.K_M = self.kernel(self.X_bar_opt, self.X_bar_opt, self.log_c_opt, self.log_b_opt) + jitter * jnp.eye(self.M)    
-        self.K_NM = self.kernel(self.X, self.X_bar_opt, self.log_c_opt, self.log_b_opt)
-        self.K_M_inv = jnp.linalg.inv(self.K_M)
-        quad_terms = jnp.sum(self.K_NM @ self.K_M_inv * self.K_NM, axis=1)  # More efficient computation
-    
-        # Correct lambda_diag: c - quad_terms
-        lambda_diag = c - quad_terms
-        self.inv_lambda_plus_sigma = 1.0 / (lambda_diag + sigma_sq)
+        This method implements the key equations from the SPGP model to compute
+        the posterior distribution over the latent function values at the
+        inducing points (pseudo-targets). It uses the optimized hyperparameters
+        and inducing point locations from training.
         
-        # Compute Q = K_M + K_NM^T (Λ + σ²I)^{-1} K_NM
-        Q = self.K_M + self.K_NM.T @ jnp.diag(self.inv_lambda_plus_sigma) @ self.K_NM
-        self.Q_inv = jnp.linalg.inv(Q)
-        mean = self.K_M @ self.Q_inv @ self.K_NM.T @ jnp.linalg.inv(jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N)) @ self.y
-        cov = self.K_M @ self.Q_inv @ self.K_M
+        The computation includes:
+        1. Kernel matrix computations (K_M, K_NM)
+        2. Lambda (diagonal correction) computation
+        3. Q matrix (M x M) for posterior
+        4. Posterior mean and covariance at inducing points
+        
+        Args:
+            jitter: Small value added to diagonal for numerical stability
+        
+        Returns:
+            Tuple of:
+            - mean: Posterior mean at inducing points (M,)
+            - cov: Posterior covariance at inducing points (M x M)
+        """
+        # Cast shapes explicitly for clarity
+        c = jnp.exp(self.log_c_opt)  # scalar
+        sigma_sq = jnp.exp(self.log_sigma_sq_opt)  # scalar
+        
+        # Compute kernel matrices with explicit shapes
+        self.K_M = self.kernel(self.X_bar_opt, self.X_bar_opt, self.log_c_opt, self.log_b_opt)  # (M, M)
+        self.K_M = self.K_M + jitter * jnp.eye(self.M)  # (M, M)
+        self.K_NM = self.kernel(self.X, self.X_bar_opt, self.log_c_opt, self.log_b_opt)  # (N, M)
+        
+        # Compute inverse of K_M
+        self.K_M_inv = jnp.linalg.inv(self.K_M)  # (M, M)
+        
+        # Compute quadratic terms efficiently
+        quad_terms = jnp.sum(self.K_NM @ self.K_M_inv * self.K_NM, axis=1)  # (N,)
+        
+        # Compute lambda diagonal
+        lambda_diag = c - quad_terms  # (N,)
+        self.inv_lambda_plus_sigma = 1.0 / (lambda_diag + sigma_sq)  # (N,)
+        
+        # Compute Q matrix
+        Q = self.K_M + self.K_NM.T @ jnp.diag(self.inv_lambda_plus_sigma) @ self.K_NM  # (M, M)
+        self.Q_inv = jnp.linalg.inv(Q)  # (M, M)
+        
+        # Compute mean and covariance
+        noise_matrix = jnp.diag(lambda_diag) + sigma_sq * jnp.eye(self.N)  # (N, N)
+        mean = self.K_M @ self.Q_inv @ self.K_NM.T @ jnp.linalg.solve(noise_matrix, self.y)  # (M,)
+        cov = self.K_M @ self.Q_inv @ self.K_M  # (M, M)
+        
         return mean, cov
 
     def fit(self, X, y):
+        """
+        Fits the Sparse GP model by optimizing inducing points and hyperparameters.
         
+        This method implements the training procedure for the SPGP model:
+        1. Initializes inducing points and hyperparameters
+        2. Sets up parameter bounds for optimization
+        3. Minimizes negative log likelihood using SLSQP optimizer
+        4. Stores optimized parameters for prediction
+        
+        The optimization includes:
+        - Inducing point locations (X_bar)
+        - Kernel amplitude (log_c)
+        - Length scales (log_b)
+        - Noise variance (log_sigma_sq)
+        
+        Args:
+            X: Training inputs (N x D)
+            y: Training targets (N,)
+        
+        Returns:
+            Tuple containing:
+            - mean_f_bar: Posterior mean at inducing points (M,)
+            - cov_f_bar: Posterior covariance at inducing points (M x M)
+            - X_bar_opt: Optimized inducing points (M x D)
+            - log_c_opt: Optimized log kernel amplitude
+            - log_b_opt: Optimized log length scales (D,)
+            - log_sigma_sq_opt: Optimized log noise variance
+            - X_bar_init: Initial inducing points (M x D)
+        """
         self.X = X
         self.y = y
         # Enable float64 support in JAX
@@ -234,13 +316,26 @@ class SparseGPModel:
 
     def predict(self, X_test):
         """
-        Predict mean and variance for test points using the trained sparse GP model.
+        Predicts mean and variance for test points using the trained SPGP model.
+        
+        This method implements the sparse GP prediction equations from 
+        Snelson & Ghahramani (2006). It computes both the predictive mean
+        and variance efficiently using the pre-computed matrices from training.
+        
+        The prediction uses the deterministic inducing point approximation:
+        mean = k*ᵀ Q⁻¹ Kₘₙᵀ Λ⁻¹ y
+        var = k** - k*ᵀ (Kₘ⁻¹ - Q⁻¹) k* + σ²
         
         Args:
-            X_test: Test points to predict (N_test x D)
-            
+            X_test: Test input points (N_test x D)
+        
         Returns:
-            Tuple of (mean, variance) for predictions at test points
+            Tuple of:
+            - mean: Predictive mean at test points (N_test,)
+            - var: Predictive variance at test points (N_test,)
+            
+        Note:
+            Requires the model to be fitted first (self.X_bar_opt etc. must exist)
         """
         sigma_sq = jnp.exp(self.log_sigma_sq_opt)
         
